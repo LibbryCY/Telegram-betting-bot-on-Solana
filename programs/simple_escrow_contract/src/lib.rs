@@ -26,12 +26,6 @@ pub mod token_price_betting_game {
         let game_state = &mut ctx.accounts.game_state;
         let games = &mut ctx.accounts.games;
 
-        // Only admin can create games
-        require!(
-            game_state.admin == ctx.accounts.admin.key(),
-            BettingError::NotAuthorized
-        );
-
         // Validate game time
         let clock = Clock::get()?;
         let current_time = clock.unix_timestamp;
@@ -54,7 +48,8 @@ pub mod token_price_betting_game {
             is_active: true,
             is_completed: false,
             is_aborted: false,
-            actual_price: None,
+            starting_price: None,
+            ending_price:None,
             total_bet_amount: 0,
         });
 
@@ -71,7 +66,7 @@ pub mod token_price_betting_game {
     pub fn place_bet(
         ctx: Context<PlaceBet>,
         game_id: u64,
-        predicted_price: u64,
+        position: BetPosition,
         amount: u64,
     ) -> Result<()> {
         let game_state = &mut ctx.accounts.game_state;
@@ -86,7 +81,7 @@ pub mod token_price_betting_game {
             .ok_or(BettingError::GameNotFound)?;
         let game = &mut games.games[game_index];
 
-        // Check if game is active and within time bounds
+        // check the time
         let clock = Clock::get()?;
         let current_time = clock.unix_timestamp;
 
@@ -99,7 +94,7 @@ pub mod token_price_betting_game {
         );
         require!(current_time < game.end_time, BettingError::GameAlreadyEnded);
 
-        // Transfer tokens from user to escrow
+        // transfer tokens from user to escrow
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -116,7 +111,7 @@ pub mod token_price_betting_game {
         bets.bets.push(Bet {
             bettor: ctx.accounts.user.key(),
             game_id,
-            predicted_price,
+            position,
             amount,
             is_claimed: false,
         });
@@ -128,53 +123,124 @@ pub mod token_price_betting_game {
         emit!(BetPlacedEvent {
             game_id,
             bettor: ctx.accounts.user.key(),
-            predicted_price,
+            position,
             amount,
         });
 
         Ok(())
     }
 
-    pub fn end_game(ctx: Context<EndGame>, game_id: u64, actual_price: u64) -> Result<()> {
+    pub fn end_game(
+        ctx: Context<EndGame>,
+        game_id: u64,
+        starting_price: u64,
+        ending_price: u64,
+    ) -> Result<()> {
         let game_state = &mut ctx.accounts.game_state;
         let games = &mut ctx.accounts.games;
-
-        // Only admin can end games
-        require!(
-            game_state.admin == ctx.accounts.admin.key(),
-            BettingError::NotAuthorized
-        );
-
-        // Find the game
+        //let bets = &mut ctx.accounts.bets;
+    
         let game_index = games
             .games
             .iter()
             .position(|g| g.id == game_id)
             .ok_or(BettingError::GameNotFound)?;
         let game = &mut games.games[game_index];
-
-        // Check if game is active and time has ended
+    
         let clock = Clock::get()?;
         let current_time = clock.unix_timestamp;
-
+    
         require!(game.is_active, BettingError::GameNotActive);
         require!(!game.is_completed, BettingError::GameAlreadyCompleted);
         require!(!game.is_aborted, BettingError::GameAborted);
         require!(current_time >= game.end_time, BettingError::GameNotEnded);
-
-        // Mark game as completed and set the actual price
+    
+        // update game state
         game.is_completed = true;
         game.is_active = false;
-        game.actual_price = Some(actual_price);
-
+        game.starting_price = Some(starting_price);
+        game.ending_price = Some(ending_price);
+    
         emit!(GameEndedEvent {
             game_id,
-            actual_price,
+            starting_price,
+            ending_price,
         });
-
+    
+       
         Ok(())
     }
 
+    pub fn distribute_winnings(
+        ctx: Context<DistributeWinnings>,
+        game_id: u64,
+    ) -> Result<()> {
+        let game_state = &mut ctx.accounts.game_state;
+        let games = &ctx.accounts.games;
+        let bets = &mut ctx.accounts.bets;
+        let winner = &ctx.accounts.winner;
+        let winner_token_account = &ctx.accounts.winner_token_account;
+    
+        let game_index = games
+            .games
+            .iter()
+            .position(|g| g.id == game_id)
+            .ok_or(BettingError::GameNotFound)?;
+        let game = &games.games[game_index];
+    
+        require!(game.is_completed, BettingError::GameNotCompleted);
+        require!(!game.is_aborted, BettingError::GameAborted);
+        require!(
+            game.starting_price.is_some(),
+            BettingError::StartingPriceNotSet
+        );
+        require!(game.ending_price.is_some(), BettingError::EndingPriceNotSet);
+    
+        let winners = calculate_winners(game, &bets.bets);
+        
+        let win_amount = winners
+            .get(&winner.key())
+            .ok_or(BettingError::NoWinningsAvailable)?;
+        
+        // mark user's bets as claimed
+        let mut claimed_any = false;
+        for bet in bets.bets.iter_mut() {
+            if bet.game_id == game_id && bet.bettor == winner.key() && !bet.is_claimed {
+                bet.is_claimed = true;
+                claimed_any = true;
+            }
+        }
+        
+        require!(claimed_any, BettingError::NoBetsFound);
+    
+        // transfer winnings to user
+        let escrow_seeds = &[b"escrow".as_ref(), &[game_state.escrow_bump]];
+    
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.escrow_token_account.to_account_info(),
+                    to: winner_token_account.to_account_info(),
+                    authority: ctx.accounts.escrow_authority.to_account_info(),
+                },
+                &[escrow_seeds],
+            ),
+            *win_amount,
+        )?;
+    
+        // uppdate escrow balance
+        game_state.total_escrow_balance -= win_amount;
+    
+        emit!(WinningsDistributedEvent {
+            game_id,
+            winner: winner.key(),
+            amount: *win_amount,
+        });
+    
+        Ok(())
+    }
+    
     pub fn claim_winnings(ctx: Context<ClaimWinnings>, game_id: u64) -> Result<()> {
         let game_state = &mut ctx.accounts.game_state;
         let games = &ctx.accounts.games;
@@ -191,9 +257,20 @@ pub mod token_price_betting_game {
         // Check if game is completed
         require!(game.is_completed, BettingError::GameNotCompleted);
         require!(!game.is_aborted, BettingError::GameAborted);
-        require!(game.actual_price.is_some(), BettingError::ActualPriceNotSet);
+        require!(
+            game.starting_price.is_some(),
+            BettingError::StartingPriceNotSet
+        );
+        require!(game.ending_price.is_some(), BettingError::EndingPriceNotSet);
 
-        let actual_price = game.actual_price.unwrap();
+        let starting_price = game.starting_price.unwrap();
+        let ending_price = game.ending_price.unwrap();
+
+        let winning_position = if ending_price > starting_price {
+            BetPosition::Long
+        } else {
+            BetPosition::Short
+        };
 
         // Find user's bets for this game
         let mut user_bets = vec![];
@@ -208,11 +285,11 @@ pub mod token_price_betting_game {
 
         require!(!user_bets.is_empty(), BettingError::NoBetsFound);
 
-        // Calculate winners based on closest prediction
+        // calculate winners
         let mut winners = calculate_winners(game, &bets.bets);
         let mut total_winnings = 0;
 
-        // Check if user won and calculate winnings
+        // checck if user won and calculate winnings
         for bet in &user_bets {
             if let Some(win_amount) = winners.remove(&bet.bettor) {
                 total_winnings += win_amount;
@@ -242,7 +319,7 @@ pub mod token_price_betting_game {
             total_winnings,
         )?;
 
-        // Update escrow balance
+        // update escrow balance , - winning of round
         game_state.total_escrow_balance -= total_winnings;
 
         emit!(WinningsClaimedEvent {
@@ -400,50 +477,49 @@ pub mod token_price_betting_game {
 fn calculate_winners(game: &Game, all_bets: &[Bet]) -> HashMap<Pubkey, u64> {
     let mut winners = HashMap::new();
 
-    if game.is_completed && !game.is_aborted && game.actual_price.is_some() {
-        let actual_price = game.actual_price.unwrap();
+    if game.is_completed
+        && !game.is_aborted
+        && game.starting_price.is_some()
+        && game.ending_price.is_some()
+    {
+        let starting_price = game.starting_price.unwrap();
+        let ending_price = game.ending_price.unwrap();
         let total_pot = game.total_bet_amount;
 
-        // Calculate the distance of each bet from the actual price
-        let mut bet_distances: Vec<(Pubkey, u64, u64)> = Vec::new(); // (bettor, amount, distance)
+        // Determine winning position
+        let winning_position = if ending_price > starting_price {
+            BetPosition::Long
+        } else if ending_price < starting_price {
+            BetPosition::Short
+        } else {
+            // If price didn't change, no one wins
+            return winners;
+        };
+
+        // Find all bets with winning position
+        let mut winning_bets: Vec<(Pubkey, u64)> = Vec::new();
+        let mut total_winning_amount = 0;
 
         for bet in all_bets {
-            if bet.game_id == game.id && !bet.is_claimed {
-                let distance = if bet.predicted_price > actual_price {
-                    bet.predicted_price - actual_price
-                } else {
-                    actual_price - bet.predicted_price
-                };
-
-                bet_distances.push((bet.bettor, bet.amount, distance));
+            if bet.game_id == game.id && !bet.is_claimed && bet.position == winning_position {
+                winning_bets.push((bet.bettor, bet.amount));
+                total_winning_amount += bet.amount;
             }
         }
 
-        // Sort by distance (closest first)
-        bet_distances.sort_by_key(|&(_, _, distance)| distance);
+        // winning bets
+        if !winning_bets.is_empty() {
+            let total_losing_amount = total_pot - total_winning_amount;
 
-        // If there are any bets
-        if !bet_distances.is_empty() {
-            // Find all bets that have the minimum distance (could be multiple with same distance)
-            let min_distance = bet_distances[0].2;
-            let closest_bets: Vec<(Pubkey, u64)> = bet_distances
-                .iter()
-                .filter(|&&(_, _, distance)| distance == min_distance)
-                .map(|&(bettor, amount, _)| (bettor, amount))
-                .collect();
+            // Distribute winnings
+            for (bettor, amount) in winning_bets {
+                // bet back plus a share of the losing pot
+                let win_share = amount
+                    + (amount as u128 * total_losing_amount as u128 / total_winning_amount as u128)
+                        as u64;
 
-            // Calculate the total amount bet by winners
-            let mut total_winning_bets = 0;
-            for &(_, amount) in &closest_bets {
-                total_winning_bets += amount;
-            }
-
-            // Distribute the pot proportionally to winning bet amounts
-            for (bettor, amount) in closest_bets {
-                let win_share = (amount as u128 * total_pot as u128) / total_winning_bets as u128;
-
-                // Add to existing winnings if bettor already has an entry
-                *winners.entry(bettor).or_insert(0) += win_share as u64;
+                // add to existing winnings if bettor already has an entry (vb)
+                *winners.entry(bettor).or_insert(0) += win_share;
             }
         }
     }
@@ -453,10 +529,12 @@ fn calculate_winners(game: &Game, all_bets: &[Bet]) -> HashMap<Pubkey, u64> {
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = payer, space = 8 + 32 + 8 + 8 + 1)]
+    #[account(init, seeds = [b"game_state"],
+    bump, payer = payer, space = 8 + 32 + 8 + 8 + 1)]
     pub game_state: Account<'info, GameState>,
 
-    #[account(init, payer = payer, space = 8 + 4 + 1000)] // Adjust space as needed
+    #[account(init,seeds = [b"games", game_state.key().as_ref()],
+    bump, payer = payer, space = 8 + 4 + 1000)] // Adjust space as needed
     pub games: Account<'info, Games>,
 
     #[account(init, payer = payer, space = 8 + 4 + 2000)] // Adjust space as needed
@@ -470,13 +548,16 @@ pub struct Initialize<'info> {
 
 #[derive(Accounts)]
 pub struct CreateGame<'info> {
-    #[account(mut)]
+    #[account(mut, seeds = [b"game_state"],
+    bump)]
     pub game_state: Account<'info, GameState>,
 
-    #[account(mut)]
+    #[account(mut,
+        seeds = [b"games", game_state.key().as_ref()],
+        bump)]
     pub games: Account<'info, Games>,
 
-    pub admin: Signer<'info>,
+    pub user: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -505,12 +586,18 @@ pub struct PlaceBet<'info> {
 #[derive(Accounts)]
 pub struct EndGame<'info> {
     #[account(mut)]
+    pub admin: Signer<'info>,
+    
+    #[account(
+        mut, 
+        constraint = game_state.admin == admin.key()
+    )]
     pub game_state: Account<'info, GameState>,
-
+    
     #[account(mut)]
     pub games: Account<'info, Games>,
-
-    pub admin: Signer<'info>,
+    
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -532,10 +619,50 @@ pub struct ClaimWinnings<'info> {
     #[account(mut)]
     pub escrow_token_account: Account<'info, TokenAccount>,
 
-    /// CHECK: This is the PDA that serves as the authority for the escrow
     pub escrow_authority: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct DistributeWinnings<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    
+    #[account(
+        mut, 
+        constraint = game_state.admin == admin.key()
+    )]
+    pub game_state: Account<'info, GameState>,
+    
+    pub games: Account<'info, Games>,
+    
+    #[account(mut)]
+    pub bets: Account<'info, Bets>,
+    
+    pub winner: AccountInfo<'info>,
+    
+    #[account(
+        mut,
+        constraint = winner_token_account.owner == winner.key()
+    )]
+    pub winner_token_account: Account<'info, TokenAccount>,
+    
+    #[account(
+        seeds = [b"escrow"],
+        bump = game_state.escrow_bump,
+    )]
+    pub escrow_authority: AccountInfo<'info>,
+    
+    #[account(
+        mut,
+        constraint = escrow_token_account.owner == escrow_authority.key()
+    )]
+    pub escrow_token_account: Account<'info, TokenAccount>,
+    
+    pub token_program: Program<'info, Token>,
+    
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -621,7 +748,8 @@ pub struct Game {
     pub is_active: bool,
     pub is_completed: bool,
     pub is_aborted: bool,
-    pub actual_price: Option<u64>,
+    pub starting_price: Option<u64>,
+    pub ending_price: Option<u64>,
     pub total_bet_amount: u64,
 }
 
@@ -629,9 +757,15 @@ pub struct Game {
 pub struct Bet {
     pub bettor: Pubkey,
     pub game_id: u64,
-    pub predicted_price: u64,
+    pub position: BetPosition,
     pub amount: u64,
     pub is_claimed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, AnchorSerialize, AnchorDeserialize)]
+pub enum BetPosition {
+    Long,
+    Short,
 }
 
 #[error_code]
@@ -656,6 +790,10 @@ pub enum BettingError {
     GameNotCompleted,
     #[msg("Actual price not set")]
     ActualPriceNotSet,
+    #[msg("Ending price not set")]
+    EndingPriceNotSet,
+    #[msg("Starting price not set")]
+    StartingPriceNotSet,
     #[msg("No bets found")]
     NoBetsFound,
     #[msg("No winnings available")]
@@ -670,6 +808,10 @@ pub enum BettingError {
     InvalidGameTime,
     #[msg("Invalid game duration")]
     InvalidGameDuration,
+    #[msg("Token account not found")]
+    TokenAccountNotFound,
+    #[msg("Not enough accounts provided")]
+    NotEnoughAccounts,
 }
 
 // Events
@@ -685,14 +827,15 @@ pub struct GameCreatedEvent {
 pub struct BetPlacedEvent {
     pub game_id: u64,
     pub bettor: Pubkey,
-    pub predicted_price: u64,
+    pub position: BetPosition,
     pub amount: u64,
 }
 
 #[event]
 pub struct GameEndedEvent {
     pub game_id: u64,
-    pub actual_price: u64,
+    pub starting_price: u64,
+    pub ending_price: u64,
 }
 
 #[event]
@@ -717,5 +860,19 @@ pub struct BetRefundedEvent {
 #[event]
 pub struct AdminWithdrawEvent {
     pub admin: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct AllWinningsDistributedEvent {
+    pub game_id: u64,
+    pub total_amount: u64,
+    pub winner_count: u64,
+}
+
+#[event]
+pub struct WinningsDistributedEvent {
+    pub game_id: u64,
+    pub winner: Pubkey,
     pub amount: u64,
 }
