@@ -2,10 +2,10 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use std::collections::HashMap;
 
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+declare_id!("8Ytc3NMi1Rg76pwixFCTrqP6udeyB5dmD1ukmaYRtJjS");
 
 #[program]
-pub mod token_price_betting_game {
+pub mod simple_escrow_contract {
     use super::*;
 
     pub fn initialize(ctx: Context<Initialize>, admin: Pubkey) -> Result<()> {
@@ -619,6 +619,7 @@ pub struct ClaimWinnings<'info> {
     #[account(mut)]
     pub escrow_token_account: Account<'info, TokenAccount>,
 
+    /// CHECK: This is a PDA owned by the program, validated through seeds constraint
     pub escrow_authority: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
@@ -640,6 +641,7 @@ pub struct DistributeWinnings<'info> {
     #[account(mut)]
     pub bets: Account<'info, Bets>,
     
+    /// CHECK: This is a PDA owned by the program, validated through seeds constraint
     pub winner: AccountInfo<'info>,
     
     #[account(
@@ -652,6 +654,7 @@ pub struct DistributeWinnings<'info> {
         seeds = [b"escrow"],
         bump = game_state.escrow_bump,
     )]
+    /// CHECK: This is a PDA owned by the program, validated through seeds constraint
     pub escrow_authority: AccountInfo<'info>,
     
     #[account(
